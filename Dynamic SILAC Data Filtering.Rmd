@@ -1,0 +1,117 @@
+---
+title: "Dynamic SILAC Data Filtering"
+---
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(purrr)
+library(stringr)
+
+# Specify input file
+input_file_name <- "Input.xlsx"  
+sheet_name <- " "  
+
+# Specify columns for analysis
+identifier_columns <- 1:4
+light_columns <- 5:16 # Must be same amount of columns as heavy
+heavy_columns <- 17:28 # Must be same amount of columns as light
+
+# Specify name of Heavy/Light pairs
+group_names <- c("DN1", "DN2", "DN3", "DMEM1", "DMEM2", "DMEM3", "BP1", "BP2", "BP3", "NB1", "NB2", "NB3") # Must have a group for every heavy/light column pair
+
+# Specify output file name
+output_file_name <- "Output.xlsx"
+
+custom_sum <- function(x) {
+  if (all(is.na(x))) {
+    return(NA)
+  } else {
+    return(sum(x, na.rm = TRUE))
+  }
+}
+
+harmonic_mean <- function(x) {
+  x <- na.omit(x)
+  if (length(x) == 0 || any(x == 0)) return(NA)
+  hm <- length(x) / sum(1 / x)
+  return(hm)
+}
+
+
+aggregate_data <- function(df, identifier_cols, light_cols, heavy_cols) {
+  if (!"PEP.StrippedSequence" %in% identifier_cols) {
+    stop("'PEP.StrippedSequence' column is missing in the identifier columns.")
+  }
+  numeric_cols <- c(light_cols, heavy_cols)
+  df_aggregated <- df %>%
+    group_by(PEP.StrippedSequence) %>%
+    summarise(across(all_of(setdiff(identifier_cols, "PEP.StrippedSequence")), first),
+              across(all_of(numeric_cols), custom_sum), .groups = 'drop')
+  return(df_aggregated)
+}
+
+aggregate_data_hm <- function(df, identifier_cols, data_cols) {
+  if (!"PG.ProteinGroups" %in% identifier_cols) {
+    stop("'PG.ProteinGroups' column is missing in the identifier columns.")
+  }
+  df_aggregated <- df %>%
+    group_by(PG.ProteinGroups) %>%
+    summarise(across(all_of(setdiff(identifier_cols, "PG.ProteinGroups")), first),
+              across(all_of(data_cols), harmonic_mean), .groups = 'drop')
+  return(df_aggregated)
+}
+
+calculate_hl_ratios <- function(df, identifier_cols, light_cols, heavy_cols, group_names) {
+  for (i in seq_along(group_names)) {
+    ratio_col_name <- paste("H/L", group_names[i], sep = " ")
+    df[[ratio_col_name]] <- ifelse(df[[heavy_cols[i]]] / df[[light_cols[i]]] < 0.02 | df[[heavy_cols[i]]] / df[[light_cols[i]]] > 100, NA, df[[heavy_cols[i]]] / df[[light_cols[i]]])
+  }
+  return(select(df, c(identifier_cols, starts_with("H/L"))))
+}
+
+calculate_half_life <- function(df_ratios, identifier_cols, group_names) {
+  for (group_name in group_names) {
+    ratio_col_name <- paste("H/L", group_name, sep = " ")
+    half_life_col_name <- paste("t1/2", group_name, sep = " ")
+    df_ratios[[half_life_col_name]] <- ifelse(is.na(df_ratios[[ratio_col_name]]), NA, (log(2) / log(1 + df_ratios[[ratio_col_name]])) * 4)
+  }
+  return(select(df_ratios, c(identifier_cols, starts_with("t1/2"))))
+}
+
+process_excel_file <- function(input_file_name, sheet_name) {
+  df <- read_excel(input_file_name, sheet = sheet_name)
+  
+  identifier_cols <- names(df)[identifier_columns]
+  light_cols <- names(df)[light_columns]
+  heavy_cols <- names(df)[heavy_columns]
+
+
+  df_cleaned <- df %>%
+    mutate(across(where(is.character), ~na_if(., "Filtered")),
+           across(where(is.numeric), ~na_if(., NA))) %>%
+    filter(!str_detect(PG.ProteinGroups, '^Cont_'))
+
+  df_cleaned[light_cols] <- lapply(df_cleaned[light_cols], function(x) ifelse(as.numeric(x) < 1000, NA, as.numeric(x)))
+  df_cleaned[heavy_cols] <- lapply(df_cleaned[heavy_cols], function(x)
+  ifelse(as.numeric(x) < 1000, NA, as.numeric(x)))
+
+  df_aggregated <- aggregate_data(df_cleaned, identifier_cols, light_cols, heavy_cols)
+  df_ratios <- calculate_hl_ratios(df_aggregated, identifier_cols, light_cols, heavy_cols, group_names)
+  df_half_life <- calculate_half_life(df_ratios, identifier_cols, group_names)
+  protein_identifier_cols <- c("PG.ProteinGroups", "PG.Genes", "PG.ProteinDescriptions")
+  half_life_data_cols <- grep("t1/2", names(df_half_life), value = TRUE)
+  df_protein_half_life <- aggregate_data_hm(df_half_life, protein_identifier_cols, half_life_data_cols)
+
+
+  write_xlsx(list("Filtered Abundance" = df_aggregated, 
+                  "Calculated Ratios" = df_ratios, 
+                  "Peptide Half-Life" = df_half_life,
+                  "Protein Half-Life" = df_protein_half_life), 
+             output_file_name)
+}
+
+process_excel_file(input_file_name, sheet_name)
+
+
+

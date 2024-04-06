@@ -1,0 +1,61 @@
+---
+title: "Label-Free Data Filtering"
+---
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(purrr)
+library(stringr)
+
+#Specify the following
+input_file <- "Input.xlsx"
+sheet_name <- " "
+output_file_name <- "Output.xlsx"
+identifier_columns <- 1:4  
+numeric_columns <- 5  # Where numeric columns start in your data
+
+process_excel_file <- function(input_file, sheet_name) {
+  df <- read_excel(input_file, sheet = sheet_name)
+
+  df_cleaned <- df %>%
+    select(-contains("EG.TotalQuantity")) %>%
+    mutate(across(where(is.character), ~na_if(., "Filtered")),
+           across(where(is.numeric), ~na_if(., NA))) %>%
+    filter(!str_detect(PG.ProteinGroups, '^Cont_'))
+
+  numeric_cols <- names(df_cleaned)[numeric_columns:ncol(df_cleaned)]
+  df_cleaned[numeric_cols] <- lapply(df_cleaned[numeric_cols], function(x) as.numeric(as.character(x)))
+  identifier_cols <- names(df_cleaned)[identifier_columns]
+
+  process_sequence <- function(sequence) {
+    df_subset <- df_cleaned %>% filter(PEP.StrippedSequence == sequence)
+    existing_numeric_cols <- intersect(numeric_cols, names(df_subset))
+    df_aggregated_subset <- df_subset %>%
+      summarise(across(all_of(identifier_cols), first),
+                across(all_of(existing_numeric_cols), \(x) if(all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)), .groups = 'drop')
+
+    return(df_aggregated_subset)
+  }
+
+  pep_counts <- df_cleaned %>% count(PEP.StrippedSequence)
+  unique_seqs <- pep_counts %>% filter(n == 1) %>% pull(PEP.StrippedSequence)
+  replicated_seqs <- pep_counts %>% filter(n > 1) %>% pull(PEP.StrippedSequence)
+
+  df_unique <- df_cleaned %>% filter(PEP.StrippedSequence %in% unique_seqs)
+  df_replicated_aggregated <- pmap_dfr(list(replicated_seqs), ~process_sequence(..1))
+  df_peptide <- bind_rows(df_unique, df_replicated_aggregated) %>%
+    mutate(across(all_of(numeric_cols), ~replace(., . < 1000, NA)))
+
+  protein_identifier_cols <- setdiff(identifier_cols, "PEP.StrippedSequence")  
+  df_protein <- df_peptide %>%
+    select(-PEP.StrippedSequence) %>%
+    group_by(across(all_of(protein_identifier_cols))) %>%
+    summarise(across(all_of(numeric_cols), \(x) if(all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)), .groups = 'drop')
+
+
+  write_xlsx(list(Peptide = df_peptide, Protein = df_protein), output_file_name)
+}
+
+process_excel_file(input_file, sheet_name)
+
